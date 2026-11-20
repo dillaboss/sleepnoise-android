@@ -137,7 +137,8 @@
 "use strict";
 /* ======================= settings ======================= */
 const DEFAULTS = {
-  volume: 0.7, tone: 900, rumble: 45, color: 0, width: 0.6, waves: 0, wavePeriod: 12, fadeIn: 8, fadeOut: 4,
+  // Sound defaults fitted to MyBrownNoise.mp3 (spectrum within ~1 dB from 25 Hz to 2.5 kHz, same loudness at 75%)
+  volume: 0.75, tone: 168, rumble: 65, color: 0.7, width: 1, waves: 0, wavePeriod: 12, fadeIn: 8, fadeOut: 4,
   introOn: true, introVol: 0.8, noiseDelay: 3.5,
   voiceOn: true, wake: "hey brownie", chime: true, chimeVol: 0.25, duck: 0.3, minConf: 0.6, micFx: false, micGain: 1,
   autoStart: "", autoStop: "",
@@ -148,6 +149,12 @@ const NATIVE = typeof window.SleepNoiseNative !== "undefined";
 const APPMODE = NATIVE || /[?&]app=1/.test(location.search);
 let S = Object.assign({}, DEFAULTS);
 try { Object.assign(S, JSON.parse(localStorage.getItem(KEY) || "{}")); } catch (e) {}
+const SOUND_VERSION = 2;   // bump when the default sound changes; resets only the sound sliders once
+if ((S._soundVersion || 1) < SOUND_VERSION) {
+  for (const k of ["volume", "tone", "rumble", "color", "width", "waves", "wavePeriod"]) S[k] = DEFAULTS[k];
+  S._soundVersion = SOUND_VERSION;
+  try { localStorage.setItem(KEY, JSON.stringify(S)); } catch (e) {}
+}
 function save() { try { localStorage.setItem(KEY, JSON.stringify(S)); } catch (e) {} }
 
 const COMMANDS = [
@@ -229,7 +236,8 @@ self.onmessage = e => {
 };`;
 const NOISE_LEN = 1 << 21;   // 2,097,152 frames = 43.7 s at 48 kHz
 
-let ctx, colorB, colorP, wLL, wLR, wRL, wRR, widthComp, hpf, lpf, waveGain, lfo, lfoGain, fade, duckG, master, makeup, limiter, introGain, chimeOut, jingleBuf;
+const HP_Q = 4.2, LP_Q = 1.9;
+let hpf2, ctx, colorB, colorP, wLL, wLR, wRL, wRR, widthComp, hpf, lpf, waveGain, lfo, lfoGain, fade, duckG, master, makeup, limiter, introGain, chimeOut, jingleBuf;
 let playing = false, introSrc = null, engineKind = "", noiseReady = false, diag = { noise: "preparing", jingle: "loading" };
 
 function startLoop(kind, L, R, ms) {
@@ -304,17 +312,18 @@ async function initAudio() {
   split.connect(wLL, 0); split.connect(wLR, 0); split.connect(wRL, 1); split.connect(wRR, 1);
   wLL.connect(merge, 0, 0); wRL.connect(merge, 0, 0); wLR.connect(merge, 0, 1); wRR.connect(merge, 0, 1);
   widthComp = ctx.createGain(); merge.connect(widthComp);
-  hpf = ctx.createBiquadFilter(); hpf.type = "highpass"; hpf.Q.value = 0.707;
-  lpf = ctx.createBiquadFilter(); lpf.type = "lowpass";  lpf.Q.value = 0.707;
+  hpf = ctx.createBiquadFilter(); hpf.type = "highpass"; hpf.Q.value = HP_Q;
+  hpf2 = ctx.createBiquadFilter(); hpf2.type = "highpass"; hpf2.Q.value = HP_Q;
+  lpf = ctx.createBiquadFilter(); lpf.type = "lowpass";  lpf.Q.value = LP_Q;
   waveGain = ctx.createGain();
   lfo = ctx.createOscillator(); lfo.type = "sine"; lfoGain = ctx.createGain(); lfo.connect(lfoGain).connect(waveGain.gain); lfo.start();
   fade = ctx.createGain(); fade.gain.value = 0;
   duckG = ctx.createGain();
-  makeup = ctx.createGain(); makeup.gain.value = 1.6;
+  makeup = ctx.createGain(); makeup.gain.value = 1;
   master = ctx.createGain();
   limiter = ctx.createDynamicsCompressor();
-  limiter.threshold.value = -3; limiter.knee.value = 6; limiter.ratio.value = 12; limiter.attack.value = 0.01; limiter.release.value = 0.4;
-  widthComp.connect(hpf).connect(lpf).connect(waveGain).connect(fade).connect(makeup).connect(duckG).connect(master).connect(limiter).connect(ctx.destination);
+  limiter.threshold.value = -1; limiter.knee.value = 2; limiter.ratio.value = 12; limiter.attack.value = 0.01; limiter.release.value = 0.4;
+  widthComp.connect(hpf).connect(hpf2).connect(lpf).connect(waveGain).connect(fade).connect(makeup).connect(duckG).connect(master).connect(limiter).connect(ctx.destination);
   introGain = ctx.createGain(); introGain.connect(duckG);
   chimeOut = ctx.createGain(); chimeOut.connect(limiter);
   applySound(true);
@@ -323,12 +332,41 @@ async function initAudio() {
   ctx.onstatechange = () => { if (ctx.state !== "running") ctx.resume().catch(() => {}); };
 }
 
+/* Predicted RMS of the noise after the filters (Web Audio's biquad formulas), used to hold loudness steady. */
+function biquadMag2(type, f0, qdb, f, sr) {
+  const w0 = 2 * Math.PI * f0 / sr, a = Math.sin(w0) / (2 * Math.pow(10, qdb / 20)), c = Math.cos(w0);
+  const b0 = type === "lp" ? (1 - c) / 2 : (1 + c) / 2, b1 = type === "lp" ? 1 - c : -(1 + c);
+  const a0 = 1 + a, a1 = -2 * c, a2 = 1 - a, w = 2 * Math.PI * f / sr;
+  const cr = Math.cos(w), ci = -Math.sin(w), c2r = Math.cos(2 * w), c2i = -Math.sin(2 * w);
+  const nr = b0 + b1 * cr + b0 * c2r, ni = b1 * ci + b0 * c2i, dr = a0 + a1 * cr + a2 * c2r, di = a1 * ci + a2 * c2i;
+  return (nr * nr + ni * ni) / (dr * dr + di * di);
+}
+let NORM = null;
+function filteredRms(sr) {
+  const fmax = sr / 2;
+  if (!NORM) {   // integrals of the raw brown and pink shapes (each generated at 0.25 RMS)
+    let b = 0, p = 0; for (let f = 1; f < fmax; f += 2) { b += 2 / (f * f + 400); p += 2 / Math.sqrt(f * f + 400); }
+    NORM = { b: 0.0625 / b, p: 0.0625 / p };
+  }
+  const cb = Math.cos(S.color * Math.PI / 2) ** 2, cp = Math.sin(S.color * Math.PI / 2) ** 2;
+  let acc = 0, prev = 1, fPrev = 1;
+  for (let i = 1; i <= 600; i++) {               // log-spaced trapezoid integration, 1 Hz .. Nyquist
+    const f = Math.pow(fmax, i / 600), P = cb * NORM.b / (f * f + 400) + cp * NORM.p / Math.sqrt(f * f + 400);
+    const hp = biquadMag2("hp", S.rumble, HP_Q, f, sr), v = P * hp * hp * biquadMag2("lp", S.tone, LP_Q, f, sr);
+    if (i > 1) acc += (v + prev) / 2 * (f - fPrev);
+    prev = v; fPrev = f;
+  }
+  return Math.sqrt(acc);
+}
+const TARGET_RMS = 0.327;   // -9.7 dBFS before the volume control; at 75% volume that's your file's -14.7 dBFS
+
 function applySound(instant) {
   if (!ctx) return;
   const t = ctx.currentTime, k = instant ? 0.001 : 0.08;
   master.gain.setTargetAtTime(S.volume * S.volume, t, k);           // squared = perceptual taper
   lpf.frequency.setTargetAtTime(S.tone, t, k);
-  hpf.frequency.setTargetAtTime(S.rumble, t, k);
+  hpf.frequency.setTargetAtTime(S.rumble, t, k); hpf2.frequency.setTargetAtTime(S.rumble, t, k);
+  makeup.gain.setTargetAtTime(clamp(TARGET_RMS / filteredRms(ctx.sampleRate), 0.05, 40), t, k);
   waveGain.gain.setTargetAtTime(1 - S.waves / 2, t, k);
   lfoGain.gain.setTargetAtTime(S.waves / 2, t, k);
   lfo.frequency.setTargetAtTime(1 / S.wavePeriod, t, k);
@@ -523,8 +561,8 @@ function run(cmd) {
     case "stop": pause(); break;
     case "louder": nudgeVolume(+0.08); break;
     case "quieter": nudgeVolume(-0.08); break;
-    case "deeper": S.tone = clamp(Math.round(S.tone * 0.8), 150, 4000); applySound(); save(); syncForm(); break;
-    case "brighter": S.tone = clamp(Math.round(S.tone * 1.25), 150, 4000); applySound(); save(); syncForm(); break;
+    case "deeper": S.tone = clamp(Math.round(S.tone * 0.8), 80, 4000); applySound(); save(); syncForm(); break;
+    case "brighter": S.tone = clamp(Math.round(S.tone * 1.25), 80, 4000); applySound(); save(); syncForm(); break;
   }
   toast(cmd.say);
 }
@@ -578,8 +616,8 @@ const fmtPct = v => Math.round(v * 100) + "%";
 const SCHEMA = [
   { sec: "Sound" },
   { k: "volume", name: "Volume", min: 0, max: 1, step: 0.01, fmt: fmtPct },
-  { k: "tone", name: "Tone", min: 150, max: 4000, log: true, fmt: v => Math.round(v) + " Hz", ends: ["Deeper", "Brighter"], hint: "Top of the sound. Lower is darker and more muffled, like a distant waterfall." },
-  { k: "rumble", name: "Rumble cut", min: 20, max: 200, log: true, fmt: v => Math.round(v) + " Hz", ends: ["Full rumble", "Tighter"], hint: "Removes bass a small speaker can’t reproduce. Raise it if the Soundcore buzzes or flutters." },
+  { k: "tone", name: "Tone", min: 80, max: 4000, log: true, fmt: v => Math.round(v) + " Hz", ends: ["Deeper", "Brighter"], hint: "Top of the sound. Lower is darker and more muffled, like a distant waterfall." },
+  { k: "rumble", name: "Rumble cut", min: 20, max: 200, log: true, fmt: v => Math.round(v) + " Hz", ends: ["Full rumble", "Tighter"], hint: "Where the deep bass is cut off. Just above this point there’s a warm, full-bodied bump. Raise it if the Soundcore buzzes or flutters." },
   { k: "color", name: "Colour", min: 0, max: 1, step: 0.01, fmt: v => v < 0.02 ? "Pure brown" : Math.round(v * 100) + "% pink", ends: ["Brown", "Pink"] },
   { k: "width", name: "Stereo width", min: 0, max: 1, step: 0.01, fmt: v => v < 0.02 ? "Mono" : fmtPct(v) },
   { k: "waves", name: "Ocean swell", min: 0, max: 0.6, step: 0.01, fmt: v => v < 0.01 ? "Off" : fmtPct(v / 0.6), hint: "A slow rise and fall in volume, like breathing or waves." },

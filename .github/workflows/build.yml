@@ -1,0 +1,59 @@
+name: Build APK
+
+on:
+  push:
+    branches: [main]
+    paths-ignore: ['README.md']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+
+      - name: Assemble the web app into the APK assets
+        run: python3 web/build.py web/IntroJingle.wav web/model-slim.tar.gz web/vocab.txt app/src/main/assets/index.html
+
+      - name: Build signed APK
+        id: build
+        shell: bash
+        run: |
+          set -o pipefail
+          gradle :app:assembleRelease --stacktrace --no-daemon -PbuildNumber=${{ github.run_number }} 2>&1 | tee build.log
+
+      - name: Upload APK artifact
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: SleepNoise-${{ github.run_number }}
+          path: app/build/outputs/apk/release/*.apk
+
+      # Publishes the APK (or the failure log) to the apk-builds branch so it's easy to grab.
+      - name: Publish to apk-builds branch
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p out
+          cp app/build/outputs/apk/release/*.apk out/SleepNoise.apk 2>/dev/null || true
+          cp build.log out/build.log 2>/dev/null || true
+          echo "run=${{ github.run_number }} sha=${{ github.sha }} build=${{ steps.build.outcome }}" > out/status.txt
+          cd out
+          git init -q -b apk-builds
+          git config user.name "github-actions"
+          git config user.email "github-actions@users.noreply.github.com"
+          git add -A
+          git commit -qm "Build #${{ github.run_number }}: ${{ steps.build.outcome }}"
+          git push -qf "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" apk-builds

@@ -1,0 +1,53 @@
+plugins {
+    id 'com.android.application'
+}
+
+def buildNumber = (project.findProperty('buildNumber') ?: '1') as int
+
+android {
+    namespace 'ca.sleepnoise'
+    compileSdk 34
+
+    defaultConfig {
+        applicationId 'ca.sleepnoise'
+        minSdk 26
+        targetSdk 34
+        versionCode buildNumber
+        versionName "1.0.${buildNumber}"
+    }
+
+    // Fixed key kept in the repo so every build can install over the previous one (settings are kept).
+    signingConfigs {
+        release {
+            storeFile file('release.keystore')
+            storePassword 'sleepnoise'
+            keyAlias 'sleepnoise'
+            keyPassword 'sleepnoise'
+        }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            signingConfig signingConfigs.release
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    androidResources {
+        noCompress += ['html']
+    }
+
+    lint {
+        checkReleaseBuilds false
+        abortOnError false
+    }
+}
+
+dependencies {
+    implementation 'androidx.webkit:webkit:1.11.0'
+}

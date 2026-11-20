@@ -178,72 +178,132 @@ let toastT;
 function toast(msg) { const t = $("toast"); t.textContent = msg; t.classList.add("show"); clearTimeout(toastT); toastT = setTimeout(() => t.classList.remove("show"), 1800); }
 
 /* ======================= audio engine ======================= */
-const WORKLET = `
-const A = 1 - 2 * Math.PI * 20 / sampleRate;                // integrator corner ~20 Hz
-const BN = 0.25 / Math.sqrt((1 - A) / (1 + A) / 3);         // normalise brown to ~0.25 RMS
-const PK = 0.141;                                           // normalise pink to ~0.25 RMS
-function mk(seed) { return { x: (Math.imul(seed, 2654435761) >>> 0) || 1, b: 0, p: new Float64Array(7) }; }
-function step(s, c) {
-  let x = s.x; x ^= x << 13; x ^= x >>> 17; x ^= x << 5; s.x = x >>> 0;
-  const w = s.x / 2147483648 - 1;
-  s.b = A * s.b + (1 - A) * w;
-  const brown = s.b * BN;
-  if (c <= 0) return brown;
-  const p = s.p;
-  p[0] = 0.99886 * p[0] + w * 0.0555179; p[1] = 0.99332 * p[1] + w * 0.0750759; p[2] = 0.96900 * p[2] + w * 0.1538520;
-  p[3] = 0.86650 * p[3] + w * 0.3104856; p[4] = 0.55000 * p[4] + w * 0.5329522; p[5] = -0.7616 * p[5] - w * 0.0168980;
-  const pink = (p[0] + p[1] + p[2] + p[3] + p[4] + p[5] + p[6] + w * 0.5362) * PK; p[6] = w * 0.115926;
-  return brown * (1 - c) + pink * c;
-}
-class BrownNoise extends AudioWorkletProcessor {
-  constructor() { super(); this.color = 0; this.width = 0.6; this.s = [mk(7), mk(1913), mk(50021)];
-    this.port.onmessage = e => Object.assign(this, e.data); }
-  process(_, outs) {
-    const o = outs[0], L = o[0], R = o[1] || o[0], n = L.length, c = this.color;
-    const gm = Math.sqrt(1 - this.width), gs = Math.sqrt(this.width);
-    for (let i = 0; i < n; i++) {
-      const m = step(this.s[0], c), l = step(this.s[1], c), r = step(this.s[2], c);
-      L[i] = gm * m + gs * l; R[i] = gm * m + gs * r;
+/* The noise is synthesised once, up front, as a ~44 s stereo buffer shaped in the frequency domain
+   (so it loops with no seam), then played by the browser's native looping player. Nothing runs in
+   JavaScript while it plays, so a busy or slow phone can't make it crackle. */
+const NOISE_GEN = `
+function fft(re, im) {                       // in-place radix-2, size power of two
+  const n = re.length;
+  for (let i = 1, j = 0; i < n; i++) {
+    let bit = n >> 1; for (; j & bit; bit >>= 1) j ^= bit; j ^= bit;
+    if (i < j) { let t = re[i]; re[i] = re[j]; re[j] = t; t = im[i]; im[i] = im[j]; im[j] = t; }
+  }
+  for (let len = 2; len <= n; len <<= 1) {
+    const ang = 2 * Math.PI / len, wr = Math.cos(ang), wi = Math.sin(ang), half = len >> 1;
+    for (let i = 0; i < n; i += len) {
+      let cr = 1, ci = 0;
+      for (let k = 0; k < half; k++) {
+        const a = i + k, b = a + half;
+        const xr = re[b] * cr - im[b] * ci, xi = re[b] * ci + im[b] * cr;
+        re[b] = re[a] - xr; im[b] = im[a] - xi; re[a] += xr; im[a] += xi;
+        const ncr = cr * wr - ci * wi; ci = cr * wi + ci * wr; cr = ncr;
+      }
     }
-    return true;
   }
 }
-registerProcessor("brown-noise", BrownNoise);`;
-
-let ctx, noise, hpf, lpf, waveGain, lfo, lfoGain, fade, duckG, master, makeup, limiter, introGain, chimeOut, jingleBuf;
-let playing = false, introSrc = null, engineKind = "";
-
-async function makeNoiseNode() {
-  try {
-    let ok = false;
-    for (const url of [URL.createObjectURL(new Blob([WORKLET], { type: "application/javascript" })), "data:application/javascript;base64," + btoa(WORKLET)]) {
-      try { await ctx.audioWorklet.addModule(url); ok = true; break; } catch (e) { console.warn("worklet load failed for", url.slice(0, 30), e); }
-    }
-    if (!ok) throw new Error("no worklet");
-    engineKind = "worklet";
-    return new AudioWorkletNode(ctx, "brown-noise", { numberOfInputs: 0, numberOfOutputs: 1, outputChannelCount: [2] });
-  } catch (e) {
-    // Fallback: same generator on the main thread
-    console.warn("AudioWorklet unavailable, using ScriptProcessor", e);
-    engineKind = "script";
-    const sampleRate = ctx.sampleRate;
-    const mod = {}; new Function("sampleRate", "registerProcessor", "AudioWorkletProcessor", WORKLET + "\nthis.step=step;this.mk=mk;").call(mod, sampleRate, () => {}, class {});
-    const st = [mod.mk(7), mod.mk(1913), mod.mk(50021)];
-    const node = ctx.createScriptProcessor(4096, 0, 2);
-    node.cfg = { color: 0, width: 0.6 };
-    node.port = { postMessage: d => Object.assign(node.cfg, d) };
-    node.onaudioprocess = ev => {
-      const L = ev.outputBuffer.getChannelData(0), R = ev.outputBuffer.getChannelData(1), c = node.cfg.color;
-      const gm = Math.sqrt(1 - node.cfg.width), gs = Math.sqrt(node.cfg.width);
-      for (let i = 0; i < L.length; i++) { const m = mod.step(st[0], c), l = mod.step(st[1], c), r = mod.step(st[2], c); L[i] = gm * m + gs * l; R[i] = gm * m + gs * r; }
-    };
-    return node;
+function makeNoise(n, sr, kind, seed) {
+  let x = (seed * 2654435761 >>> 0) || 1;
+  const rnd = () => { x ^= x << 13; x ^= x >>> 17; x ^= x << 5; return ((x >>> 0) + 0.5) / 4294967296; };
+  const re = new Float64Array(n), im = new Float64Array(n);
+  // Random complex spectrum with a real, symmetric magnitude shape: the inverse transform's real and
+  // imaginary parts are two independent noises (left and right) with exactly that spectrum, and periodic.
+  for (let k = 1; k < n; k++) {
+    const f = (k <= n / 2 ? k : n - k) * sr / n;
+    const h = kind === "pink" ? Math.pow(f * f + 400, -0.25) : 1 / Math.sqrt(f * f + 400);   // 20 Hz corner
+    const r = Math.sqrt(-2 * Math.log(rnd())) * h, t = 2 * Math.PI * rnd();
+    re[k] = r * Math.cos(t); im[k] = r * Math.sin(t);
   }
+  fft(re, im);
+  const L = new Float32Array(n), R = new Float32Array(n);
+  let sl = 0, sr2 = 0; for (let i = 0; i < n; i++) { sl += re[i] * re[i]; sr2 += im[i] * im[i]; }
+  const gl = 0.25 / Math.sqrt(sl / n), gr = 0.25 / Math.sqrt(sr2 / n);
+  for (let i = 0; i < n; i++) { L[i] = re[i] * gl; R[i] = im[i] * gr; }
+  return [L, R];
+}
+self.onmessage = e => {
+  const { n, sr } = e.data;
+  for (const [kind, seed] of [["brown", 7], ["pink", 1913]]) {
+    const t0 = Date.now(), [L, R] = makeNoise(n, sr, kind, seed);
+    self.postMessage({ kind, L, R, ms: Date.now() - t0 }, [L.buffer, R.buffer]);
+  }
+};`;
+const NOISE_LEN = 1 << 21;   // 2,097,152 frames = 43.7 s at 48 kHz
+
+let ctx, colorB, colorP, wLL, wLR, wRL, wRR, widthComp, hpf, lpf, waveGain, lfo, lfoGain, fade, duckG, master, makeup, limiter, introGain, chimeOut, jingleBuf;
+let playing = false, introSrc = null, engineKind = "", noiseReady = false, diag = { noise: "preparing", jingle: "loading" };
+
+function startLoop(kind, L, R, ms) {
+  const buf = ctx.createBuffer(2, L.length, ctx.sampleRate);
+  buf.copyToChannel(L, 0); buf.copyToChannel(R, 1);
+  const src = ctx.createBufferSource(); src.buffer = buf; src.loop = true;
+  src.connect(kind === "brown" ? colorB : colorP); src.start();
+  diag[kind] = ms + " ms";
+  if (kind === "brown") { noiseReady = true; diag.noise = "ready"; }
+}
+function generateNoise() {
+  return new Promise(resolve => {
+    let done = 0;
+    const take = d => { startLoop(d.kind, d.L, d.R, d.ms); if (++done === 1) resolve(); };
+    try {
+      const w = new Worker(URL.createObjectURL(new Blob([NOISE_GEN], { type: "application/javascript" })));
+      w.onmessage = e => { take(e.data); if (done === 2) w.terminate(); };
+      w.onerror = e => { console.warn("noise worker failed, generating here", e); e.preventDefault(); w.terminate(); if (!done) mainThread(); };
+      w.postMessage({ n: NOISE_LEN, sr: ctx.sampleRate });
+      engineKind = "buffer (worker)";
+    } catch (e) { mainThread(); }
+    function mainThread() {
+      engineKind = "buffer (main)";
+      const mod = {}; new Function(NOISE_GEN.replace("self.onmessage", "this.unused") + "\nthis.makeNoise = makeNoise;").call(mod);
+      for (const [kind, seed] of [["brown", 7], ["pink", 1913]]) {
+        setTimeout(() => { const t0 = Date.now(), [L, R] = mod.makeNoise(NOISE_LEN, ctx.sampleRate, kind, seed); take({ kind, L, R, ms: Date.now() - t0 }); }, kind === "brown" ? 0 : 200);
+      }
+    }
+  });
+}
+
+/* WAV fallback in case the platform decoder refuses the file */
+function parseWav(bytes) {
+  const v = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  let p = 12, fmt = null;
+  while (p + 8 <= v.byteLength) {
+    const id = String.fromCharCode(v.getUint8(p), v.getUint8(p + 1), v.getUint8(p + 2), v.getUint8(p + 3)), size = v.getUint32(p + 4, true), body = p + 8;
+    if (id === "fmt ") fmt = { tag: v.getUint16(body, true), ch: v.getUint16(body + 2, true), sr: v.getUint32(body + 4, true), bits: v.getUint16(body + 14, true) };
+    if (id === "data" && fmt) {
+      const bps = fmt.bits / 8, frames = Math.floor(Math.min(size, v.byteLength - body) / (bps * fmt.ch));
+      const out = ctx.createBuffer(fmt.ch, frames, fmt.sr);
+      const float = fmt.tag === 3;
+      for (let c = 0; c < fmt.ch; c++) {
+        const d = out.getChannelData(c);
+        for (let i = 0; i < frames; i++) {
+          const o = body + (i * fmt.ch + c) * bps;
+          d[i] = float ? v.getFloat32(o, true) : bps === 2 ? v.getInt16(o, true) / 32768 : bps === 3 ? ((v.getUint8(o) | v.getUint8(o + 1) << 8 | v.getInt8(o + 2) << 16) / 8388608) : bps === 4 ? v.getInt32(o, true) / 2147483648 : (v.getUint8(o) - 128) / 128;
+        }
+      }
+      return out;
+    }
+    p = body + size + (size & 1);
+  }
+  throw new Error("no audio data in WAV");
+}
+async function loadJingle() {
+  const el = $("jingle");
+  if (!el) { diag.jingle = "missing"; return; }
+  const bytes = b64ToBytes(el.textContent);
+  try { jingleBuf = await ctx.decodeAudioData(bytes.slice().buffer); }
+  catch (e) { console.warn("decodeAudioData failed, parsing WAV directly", e); try { jingleBuf = parseWav(bytes); } catch (e2) { diag.jingle = "failed: " + e2.message; return; } }
+  diag.jingle = jingleBuf.duration.toFixed(1) + " s";
 }
 
 async function initAudio() {
   ctx = new (window.AudioContext || window.webkitAudioContext)({ latencyHint: "playback" });
-  noise = await makeNoiseNode();
+  // brown + pink loops -> colour blend -> stereo width matrix -> filters -> swell -> fade -> ...
+  colorB = ctx.createGain(); colorP = ctx.createGain();
+  const mix = ctx.createGain(), split = ctx.createChannelSplitter(2), merge = ctx.createChannelMerger(2);
+  colorB.connect(mix); colorP.connect(mix); mix.connect(split);
+  wLL = ctx.createGain(); wLR = ctx.createGain(); wRL = ctx.createGain(); wRR = ctx.createGain();   // wXY: input X -> output Y
+  split.connect(wLL, 0); split.connect(wLR, 0); split.connect(wRL, 1); split.connect(wRR, 1);
+  wLL.connect(merge, 0, 0); wRL.connect(merge, 0, 0); wLR.connect(merge, 0, 1); wRR.connect(merge, 0, 1);
+  widthComp = ctx.createGain(); merge.connect(widthComp);
   hpf = ctx.createBiquadFilter(); hpf.type = "highpass"; hpf.Q.value = 0.707;
   lpf = ctx.createBiquadFilter(); lpf.type = "lowpass";  lpf.Q.value = 0.707;
   waveGain = ctx.createGain();
@@ -253,12 +313,13 @@ async function initAudio() {
   makeup = ctx.createGain(); makeup.gain.value = 1.6;
   master = ctx.createGain();
   limiter = ctx.createDynamicsCompressor();
-  limiter.threshold.value = -4; limiter.knee.value = 4; limiter.ratio.value = 20; limiter.attack.value = 0.003; limiter.release.value = 0.25;
-  noise.connect(hpf).connect(lpf).connect(waveGain).connect(fade).connect(makeup).connect(duckG).connect(master).connect(limiter).connect(ctx.destination);
+  limiter.threshold.value = -3; limiter.knee.value = 6; limiter.ratio.value = 12; limiter.attack.value = 0.01; limiter.release.value = 0.4;
+  widthComp.connect(hpf).connect(lpf).connect(waveGain).connect(fade).connect(makeup).connect(duckG).connect(master).connect(limiter).connect(ctx.destination);
   introGain = ctx.createGain(); introGain.connect(duckG);
   chimeOut = ctx.createGain(); chimeOut.connect(limiter);
-  try { jingleBuf = await ctx.decodeAudioData(b64ToBytes($("jingle").textContent).buffer); } catch (e) { console.warn("jingle decode failed", e); }
   applySound(true);
+  await loadJingle();
+  await generateNoise();
   ctx.onstatechange = () => { if (ctx.state !== "running") ctx.resume().catch(() => {}); };
 }
 
@@ -271,7 +332,11 @@ function applySound(instant) {
   waveGain.gain.setTargetAtTime(1 - S.waves / 2, t, k);
   lfoGain.gain.setTargetAtTime(S.waves / 2, t, k);
   lfo.frequency.setTargetAtTime(1 / S.wavePeriod, t, k);
-  noise.port.postMessage({ color: S.color, width: S.width });
+  const c = S.color * Math.PI / 2, w = S.width;                      // equal-power colour blend
+  colorB.gain.setTargetAtTime(Math.cos(c), t, k); colorP.gain.setTargetAtTime(Math.sin(c), t, k);
+  const g1 = (1 + w) / 2, g2 = (1 - w) / 2;                         // mid/side width; w=0 mono, w=1 fully independent
+  wLL.gain.setTargetAtTime(g1, t, k); wRR.gain.setTargetAtTime(g1, t, k); wLR.gain.setTargetAtTime(g2, t, k); wRL.gain.setTargetAtTime(g2, t, k);
+  widthComp.gain.setTargetAtTime(1 / Math.sqrt((1 + w * w) / 2), t, k);
 }
 
 function hold(param, t) { if (param.cancelAndHoldAtTime) param.cancelAndHoldAtTime(t); else { const v = param.value; param.cancelScheduledValues(t); param.setValueAtTime(v, t); } }
@@ -492,6 +557,13 @@ function tick() {
   if (S.autoStart && hm === S.autoStart && S._firedStart !== day) { S._firedStart = day; save(); play("schedule"); }
   if (S.autoStop && hm === S.autoStop && S._firedStop !== day) { S._firedStop = day; save(); pause("schedule"); }
   const m = $("meter"); if (m) m.style.width = Math.min(100, micLevel * 400) + "%";
+  const dg = $("diag");
+  if (dg && ctx) {
+    const lat = Math.round(((ctx.baseLatency || 0) + (ctx.outputLatency || 0)) * 1000);
+    dg.innerHTML = [`Sound: ${engineKind}, ${ctx.sampleRate} Hz, ${ctx.state}, latency ${lat} ms`,
+      `Noise: ${diag.noise} (brown ${diag.brown || "…"}, pink ${diag.pink || "…"})`, `Jingle: ${diag.jingle}`,
+      `Voice: ${$("pilltext").textContent}`, `${(navigator.userAgent.match(/Chrome\/[\d.]+/) || ["?"])[0]}${NATIVE ? " · app" : ""}`].join("<br>");
+  }
 }
 
 /* --- wake lock --- */
@@ -541,6 +613,8 @@ const SCHEMA = [
   { k: "dimAfter", name: "Go dark after", min: 5, max: 120, step: 5, fmt: v => v + " s", hint: "The screen goes black with a small, slowly wandering clock to protect the S8’s OLED from burn-in. Tap anywhere to bring the controls back. The first tap only wakes the screen." },
   { k: "showClock", type: "toggle", name: "Show clock while dark" },
   { k: "resume", type: "toggle", name: "Resume after a restart", hint: "If the phone or app restarts while the noise is playing (say, after a power cut), the noise comes back on its own, without the jingle." },
+  { sec: "Diagnostics" },
+  { type: "diag" },
   ...(NATIVE ? [{ sec: "Phone" }, { type: "buttons", items: [["Android settings", () => SleepNoiseNative.openSettings()], ["Choose home app", () => SleepNoiseNative.openHomeSettings()]] }] : []),
   { type: "buttons", items: [["Reset all settings", () => { if (confirmReset()) { S = Object.assign({}, DEFAULTS); save(); applySound(); buildRecognizer(); buildForm(); render(); toast("Settings reset"); } }, "warn"]] },
 ];
@@ -586,6 +660,8 @@ function buildForm() {
     } else if (f.type === "heard") {
       row.innerHTML = `<div class="top"><span class="name">Last heard</span><span class="val">mic level</span></div><div class="heard" id="heard">${lastHeard || "—"}</div><div class="meter"><i id="meter"></i></div>
       <div class="hint">Speak a command to test. Each word shows how confident the recogniser was. If the wake word gets ignored, lower Strictness or raise Mic boost.</div>`;
+    } else if (f.type === "diag") {
+      row.innerHTML = `<div class="heard" id="diag" style="line-height:1.6"></div><div class="hint">If something sounds wrong, a screenshot of this box helps find out why.</div>`;
     } else if (f.type === "cmds") {
       row.innerHTML = `<div class="cmds" id="cmds"></div>`;
     } else {
@@ -617,7 +693,7 @@ function renderCmds() {
 $("big").onclick = toggle;
 $("vup").onclick = () => nudgeVolume(+0.05);
 $("vdown").onclick = () => nudgeVolume(-0.05);
-$("gear").onclick = () => { if (!$("form").firstChild) buildForm(); else syncForm(); $("sheet").classList.add("open"); };
+$("gear").onclick = () => { setTimeout(tick, 50); if (!$("form").firstChild) buildForm(); else syncForm(); $("sheet").classList.add("open"); };
 $("close").onclick = () => { $("sheet").classList.remove("open"); wake(); };
 // The first touch while dark only wakes the screen, so a sleepy hand can’t pause by accident.
 document.addEventListener("pointerdown", e => {
@@ -628,6 +704,7 @@ document.addEventListener("pointerdown", e => {
 let begun = false;
 async function begin() {
   if (begun) return; begun = true;
+  await pageLoaded;
   $("start").style.display = "none";
   if (!APPMODE) {
     try { await document.documentElement.requestFullscreen({ navigationUI: "hide" }); } catch (e) {}
@@ -647,7 +724,8 @@ async function begin() {
   setTimeout(initVoice, 300);
 }
 $("startbtn").onclick = begin;
-if (APPMODE) { $("start").style.display = "none"; setTimeout(begin, 0); }
+const pageLoaded = new Promise(r => document.readyState === "complete" ? r() : window.addEventListener("load", r, { once: true }));
+if (APPMODE) { $("start").style.display = "none"; pageLoaded.then(begin); }
 render();
 window.SleepNoise = { get S() { return S; }, play, pause, onResult, get playing() { return playing; }, get ctx() { return ctx; }, get voiceState() { return voiceState; }, get engine() { return engineKind; }, get windowOpen() { return windowOpen; }, get limiter() { return limiter; } };
 </script>

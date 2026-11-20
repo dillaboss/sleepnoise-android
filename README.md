@@ -11,7 +11,7 @@ A dedicated bedside brown-noise player for an old Android phone (built for a Gal
 ## Getting the APK
 
 Every push to `main` builds the app on GitHub Actions. The newest APK is published to the
-[`apk-builds`](../../tree/apk-builds) branch as `SleepNoise.apk`, and is also attached to each Actions run.
+[`apk-builds`](../../tree/apk-builds) branch as `SleepNoise.apk`, and is the download link for every build (no Actions artifacts are used, so it never hits the storage quota).
 
 ## Layout
 

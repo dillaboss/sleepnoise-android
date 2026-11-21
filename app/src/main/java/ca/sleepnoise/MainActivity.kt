@@ -45,7 +45,8 @@ class MainActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        window.addFlags(WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED or WindowManager.LayoutParams.FLAG_DISMISS_KEYGUARD)
+        if (Build.VERSION.SDK_INT >= 27) { setShowWhenLocked(true) }
+        else { @Suppress("DEPRECATION") window.addFlags(WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED) }
         volumeControlStream = AudioManager.STREAM_MUSIC
         WebView.setWebContentsDebuggingEnabled(true)
 

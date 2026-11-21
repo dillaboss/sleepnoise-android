@@ -1,6 +1,5 @@
 package ca.sleepnoise
 
-import android.content.Context
 import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioManager
@@ -9,7 +8,7 @@ import android.os.Process
 import android.util.Log
 
 /** Owns the AudioTrack and the audio thread that pulls frames from [Renderer]. */
-class AudioEngine(ctx: Context) {
+class AudioEngine {
     val sampleRate: Int = AudioTrack.getNativeOutputSampleRate(AudioManager.STREAM_MUSIC).takeIf { it in 22050..96000 } ?: 48000
     val renderer = Renderer(sampleRate)
     private var track: AudioTrack? = null

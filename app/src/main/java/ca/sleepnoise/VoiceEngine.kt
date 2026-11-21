@@ -112,7 +112,7 @@ class VoiceEngine(private val ctx: Context, private val cb: Callbacks) {
                     buf[i] = x.coerceIn(-32768.0, 32767.0).toInt().toShort()
                 }
                 cb.onLevel((sqrt(sum / n) / 32768.0).toFloat())
-                val rz = recognizer!!
+                val rz = recognizer
                 if (rz.acceptWaveForm(buf, n)) cb.onResult(JSONObject(rz.result))
                 else JSONObject(rz.partialResult).optString("partial").let { if (it.isNotBlank()) cb.onPartial(it) }
             }

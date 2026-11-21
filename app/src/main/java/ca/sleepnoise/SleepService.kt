@@ -75,7 +75,7 @@ class SleepService : Service(), VoiceEngine.Callbacks {
         goForeground()
         wakeLock = getSystemService(PowerManager::class.java).newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "SleepNoise::service").apply { setReferenceCounted(false); acquire() }
 
-        audio = AudioEngine(this)
+        audio = AudioEngine()
         audio.start()
         applyLive()
         loadJingle()

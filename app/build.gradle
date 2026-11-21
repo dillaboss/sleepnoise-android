@@ -1,8 +1,11 @@
 plugins {
     id 'com.android.application'
+    id 'org.jetbrains.kotlin.android'
 }
 
 def buildNumber = (project.findProperty('buildNumber') ?: '1') as int
+// Signing comes from CI secrets (never from the repo). Without them the build is unsigned.
+def ks = System.getenv('SIGNING_KEYSTORE_FILE')
 
 android {
     namespace 'ca.sleepnoise'
@@ -13,23 +16,25 @@ android {
         minSdk 26
         targetSdk 34
         versionCode buildNumber
-        versionName "1.0.${buildNumber}"
+        versionName "2.0.${buildNumber}"
+        ndk { abiFilters 'arm64-v8a', 'armeabi-v7a' }
     }
 
-    // Fixed key kept in the repo so every build can install over the previous one (settings are kept).
     signingConfigs {
-        release {
-            storeFile file('release.keystore')
-            storePassword 'sleepnoise'
-            keyAlias 'sleepnoise'
-            keyPassword 'sleepnoise'
+        if (ks) {
+            release {
+                storeFile file(ks)
+                storePassword System.getenv('SIGNING_STORE_PASSWORD')
+                keyAlias System.getenv('SIGNING_KEY_ALIAS')
+                keyPassword System.getenv('SIGNING_KEY_PASSWORD')
+            }
         }
     }
 
     buildTypes {
         release {
             minifyEnabled false
-            signingConfig signingConfigs.release
+            if (ks) signingConfig signingConfigs.release
         }
     }
 
@@ -37,17 +42,19 @@ android {
         sourceCompatibility JavaVersion.VERSION_17
         targetCompatibility JavaVersion.VERSION_17
     }
-
-    androidResources {
-        noCompress += ['html']
-    }
+    kotlinOptions { jvmTarget = '17' }
 
     lint {
         checkReleaseBuilds false
         abortOnError false
     }
+    testOptions { unitTests.returnDefaultValues = true }
 }
 
 dependencies {
+    implementation 'androidx.core:core-ktx:1.13.1'
     implementation 'androidx.webkit:webkit:1.11.0'
+    implementation 'com.alphacephei:vosk-android:0.3.47'
+    implementation 'net.java.dev.jna:jna:5.13.0@aar'
+    testImplementation 'junit:junit:4.13.2'
 }

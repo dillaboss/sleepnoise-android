@@ -2,6 +2,10 @@
 build/
 app/build/
 local.properties
-app/src/main/assets/index.html
 *.iml
 .idea/
+# fetched by CI (scripts/fetch-model.sh), never committed
+app/src/main/assets/model/
+# signing keys never live in the repo
+*.jks
+*.keystore

@@ -24,25 +24,52 @@ jobs:
         with:
           gradle-version: '8.9'
 
-      - name: Assemble the web app into the APK assets
-        run: python3 web/build.py web/IntroJingle.wav web/model-slim.tar.gz web/vocab.txt app/src/main/assets/index.html
+      - name: Cache speech model download
+        uses: actions/cache@v4
+        with:
+          path: .model-cache/*.zip
+          key: vosk-model-small-en-us-0.15
 
-      - name: Build signed APK
+      - name: Fetch and verify speech model
+        run: scripts/fetch-model.sh
+
+      - name: Signing key from secrets
+        id: sign
+        shell: bash
+        env:
+          KS_B64: ${{ secrets.SIGNING_KEYSTORE_BASE64 }}
+        run: |
+          if [ -n "$KS_B64" ]; then
+            echo "$KS_B64" | base64 -d > "$RUNNER_TEMP/release.jks"
+            echo "SIGNING_KEYSTORE_FILE=$RUNNER_TEMP/release.jks" >> "$GITHUB_ENV"
+            echo "signed=yes" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::Signing secrets are not set, so this build is unsigned and can't be installed."
+            echo "signed=no" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Unit tests and APK
         id: build
         shell: bash
+        env:
+          SIGNING_STORE_PASSWORD: ${{ secrets.SIGNING_STORE_PASSWORD }}
+          SIGNING_KEY_ALIAS: ${{ secrets.SIGNING_KEY_ALIAS }}
+          SIGNING_KEY_PASSWORD: ${{ secrets.SIGNING_KEY_PASSWORD }}
         run: |
           set -o pipefail
-          gradle :app:assembleRelease --stacktrace --no-daemon -PbuildNumber=${{ github.run_number }} 2>&1 | tee build.log
+          gradle :app:testReleaseUnitTest :app:assembleRelease --stacktrace --no-daemon -PbuildNumber=${{ github.run_number }} 2>&1 | tee build.log
 
-      # Publishes the APK (or the failure log) to the apk-builds branch so it's easy to grab.
+      # Publishes the signed APK (or the failure log) to the apk-builds branch.
       - name: Publish to apk-builds branch
         if: always()
         shell: bash
         run: |
+          rm -f "$RUNNER_TEMP/release.jks"
           mkdir -p out
-          cp app/build/outputs/apk/release/*.apk out/SleepNoise.apk 2>/dev/null || true
+          if [ "${{ steps.sign.outputs.signed }}" = "yes" ]; then cp app/build/outputs/apk/release/app-release.apk out/SleepNoise.apk 2>/dev/null || true; fi
           cp build.log out/build.log 2>/dev/null || true
-          echo "run=${{ github.run_number }} sha=${{ github.sha }} build=${{ steps.build.outcome }}" > out/status.txt
+          mkdir -p out/test-results && cp -r app/build/test-results/testReleaseUnitTest/*.xml out/test-results/ 2>/dev/null || true
+          echo "run=${{ github.run_number }} sha=${{ github.sha }} build=${{ steps.build.outcome }} signed=${{ steps.sign.outputs.signed }}" > out/status.txt
           cd out
           git init -q -b apk-builds
           git config user.name "github-actions"

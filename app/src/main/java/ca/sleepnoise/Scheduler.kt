@@ -5,7 +5,6 @@ import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
 import android.os.Build
-import java.time.LocalDate
 import java.time.LocalTime
 import java.time.ZoneId
 import java.time.ZonedDateTime
@@ -22,7 +21,7 @@ object Scheduler {
 
     fun nextMillis(hm: String, now: ZonedDateTime = ZonedDateTime.now()): Long? {
         val t = runCatching { LocalTime.parse(hm) }.getOrNull() ?: return null
-        var at = ZonedDateTime.of(LocalDate.now(now.zone), t, now.zone)
+        var at = ZonedDateTime.of(now.toLocalDate(), t, now.zone)
         if (!at.isAfter(now.plusSeconds(5))) at = at.plusDays(1)
         return at.toInstant().toEpochMilli()
     }

@@ -62,9 +62,8 @@ class SleepService : Service(), VoiceEngine.Callbacks {
     private var voiceState = "busy"; private var voiceText = "Voice starting…"
     private var lastHeard = ""
     private var micLevel = 0f
-    private var shapeVersion = 0
-    private var bakedShape: NoiseShape? = null
-    private var synthMs = 0L
+    private val baker = LoopBaker<NoiseShape>()
+    @Volatile private var synthMs = 0L
     private var jingleInfo = "loading"
     private val startedAt = System.currentTimeMillis()
 
@@ -155,22 +154,20 @@ class SleepService : Service(), VoiceEngine.Callbacks {
     }
 
     /** Tone, rumble and colour are baked into the loop; regenerate it (debounced) and crossfade. */
-    private var bakingShape: NoiseShape? = null
     private fun rebakeNoise(immediate: Boolean = false) {
         main.removeCallbacks(rebakeRunnable)
         if (immediate) rebakeRunnable.run() else main.postDelayed(rebakeRunnable, 350)
     }
     private val rebakeRunnable = Runnable {
         val shape = settings.shape
-        if (shape == bakedShape || shape == bakingShape) return@Runnable
-        val v = ++shapeVersion
-        bakingShape = shape
+        val job = baker.request(shape) ?: return@Runnable     // also cancels any job for an abandoned setting
         synthPool.execute {
-            if (v != shapeVersion) return@execute                   // superseded before it started
+            if (!baker.isCurrent(job)) return@execute          // superseded before it started
             val loop = NoiseSynth.generate(audio.sampleRate, shape)
-            if (v != shapeVersion) return@execute                   // superseded while generating
+            if (!baker.complete(job, shape)) return@execute    // superseded while generating
             audio.renderer.setNoise(loop.left, loop.right)
-            main.post { bakedShape = shape; synthMs = loop.millis; pushState() }
+            synthMs = loop.millis
+            main.post { pushState() }
         }
     }
 
@@ -313,7 +310,7 @@ class SleepService : Service(), VoiceEngine.Callbacks {
         if (listeners.isEmpty()) return
         val pm = getSystemService(PowerManager::class.java)
         val diag = JSONObject()
-            .put("sound", "AudioTrack ${audio.encoding}, ${audio.sampleRate} Hz, buffer ${audio.bufferMs} ms, underruns ${audio.underruns}")
+            .put("sound", "AudioTrack ${audio.encoding}, ${audio.sampleRate} Hz, buffer ${audio.bufferMs} ms, underruns ${audio.underruns}, output restarts ${audio.restarts}")
             .put("noise", if (audio.renderer.noiseReady) "ready (generated in $synthMs ms)" else "preparing")
             .put("jingle", jingleInfo)
             .put("voice", (if (voiceState == "ready") "listening" else voiceText) + (if (voice.modelLoadMs > 0) ", model loaded in ${voice.modelLoadMs} ms" else "") + (if (voice.micInfo.isNotEmpty()) ", ${voice.micInfo}" else ""))

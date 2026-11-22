@@ -53,9 +53,67 @@ class LogicTest {
     }
 
     @Test fun scheduleNextOccurrence() {
-        val now = java.time.ZonedDateTime.of(2026, 11, 20, 22, 30, 0, 0, java.time.ZoneId.of("America/Toronto"))
-        val later = Scheduler.nextMillis("23:15", now)!!; assertEquals(45 * 60_000L, later - now.toInstant().toEpochMilli())
-        val tomorrow = Scheduler.nextMillis("07:00", now)!!; assertEquals((8 * 60 + 30) * 60_000L, tomorrow - now.toInstant().toEpochMilli())
+        val zone = java.time.ZoneId.of("America/Toronto")
+        // Several dates, including both daylight-saving switches, so the test never depends on today's date.
+        for (date in listOf("2026-11-20", "2026-11-21", "2027-01-01", "2027-03-14", "2027-11-07")) {
+            val now = java.time.LocalDate.parse(date).atTime(22, 30).atZone(zone)
+            val nowMs = now.toInstant().toEpochMilli()
+            assertEquals("$date same evening", 45 * 60_000L, Scheduler.nextMillis("23:15", now)!! - nowMs)
+            val next = java.time.Instant.ofEpochMilli(Scheduler.nextMillis("07:00", now)!!).atZone(zone)
+            assertEquals("$date next morning", now.toLocalDate().plusDays(1), next.toLocalDate())
+            assertEquals("$date next morning", java.time.LocalTime.of(7, 0), next.toLocalTime())
+        }
+        val now = java.time.ZonedDateTime.of(2026, 11, 21, 22, 30, 0, 0, zone)
         assertEquals(null, Scheduler.nextMillis("", now))
+        assertEquals("a time right now rolls to tomorrow", 24 * 3_600_000L, Scheduler.nextMillis("22:30", now)!! - now.toInstant().toEpochMilli())
+    }
+
+    /** Renders [seconds] of audio from [r] and returns the left channel. */
+    private fun renderLeft(r: Renderer, seconds: Double): FloatArray {
+        val frames = (seconds * r.sampleRate).toInt(); val out = FloatArray(frames); val blk = FloatArray(2048)
+        var f = 0
+        while (f < frames) { val n = minOf(1024, frames - f); r.render(blk, n); for (i in 0 until n) out[f + i] = blk[2 * i]; f += n }
+        return out
+    }
+
+    @Test fun crossfadeHandsOverCleanly() {
+        val sr = 48000; val n = 1 shl 16
+        val r = Renderer(sr).apply { volume = 1f }
+        r.setNoise(FloatArray(n) { 0.1f }, FloatArray(n) { 0.1f })
+        r.play(false, 0f, 0f, 0f)
+        renderLeft(r, 2.0)                                   // settle at the old level
+        r.setNoise(FloatArray(n) { 0.5f }, FloatArray(n) { 0.5f })
+        val x = renderLeft(r, 3.0)                           // 1.5 s crossfade ends mid-block
+        val end = (1.5 * sr).toInt()
+        for (i in end until x.size) assertEquals("after the crossfade only the new loop plays (sample $i)", 0.5, x[i].toDouble(), 1e-3)
+        var maxStep = 0.0; for (i in 1 until x.size) maxStep = maxOf(maxStep, abs(x[i] - x[i - 1]).toDouble())
+        assertTrue("no jumps anywhere in the crossfade (max step $maxStep)", maxStep < 1e-3)
+    }
+
+    @Test fun loopArrivingMidCrossfadeWaitsItsTurn() {
+        val sr = 48000; val n = 1 shl 16
+        val r = Renderer(sr).apply { volume = 1f }
+        r.setNoise(FloatArray(n) { 0.1f }, FloatArray(n) { 0.1f })
+        r.play(false, 0f, 0f, 0f); renderLeft(r, 2.0)
+        r.setNoise(FloatArray(n) { 0.3f }, FloatArray(n) { 0.3f })
+        val a = renderLeft(r, 0.5)
+        r.setNoise(FloatArray(n) { 0.6f }, FloatArray(n) { 0.6f })   // arrives during the first crossfade
+        val b = renderLeft(r, 4.0)
+        val x = a + b
+        var maxStep = 0.0; for (i in 1 until x.size) maxStep = maxOf(maxStep, abs(x[i] - x[i - 1]).toDouble())
+        assertTrue("no jumps (max step $maxStep)", maxStep < 1e-3)
+        assertEquals("ends on the newest loop", 0.6, x.last().toDouble(), 1e-3)
+    }
+
+    @Test fun abandonedLoopJobIsNeverUsed() {
+        val b = LoopBaker<String>()
+        val first = b.request("A")!!; assertTrue(b.complete(first, "A"))
+        val jobB = b.request("B")!!                          // tone moved to B, slow job starts
+        assertEquals(null, b.request("A"))                   // ...and straight back to A before it finishes
+        assertTrue("B's job is cancelled", !b.isCurrent(jobB))
+        assertTrue("B's finished loop is dropped", !b.complete(jobB, "B"))
+        assertEquals("A is still what plays", "A", b.baked)
+        assertEquals("asking for B again starts a fresh job", true, b.request("B") != null)
+        val jobC = b.request("C")!!; assertEquals("same shape twice doesn't restart its job", null, b.request("C")); assertTrue(b.isCurrent(jobC))
     }
 }

@@ -45,6 +45,7 @@ class Renderer(val sampleRate: Int) {
     private var t = 0L
     private var curL: FloatArray? = null; private var curR: FloatArray? = null
     private var nxtL: FloatArray? = null; private var nxtR: FloatArray? = null
+    private var queuedL: FloatArray? = null; private var queuedR: FloatArray? = null   // arrived during a crossfade
     private var pos = 0; private var xfPos = 0; private val xfLen = (1.5f * sr).toInt()
 
     private var fade = 0f; private var fadeTarget = 0f; private var fadeK = 1f
@@ -88,7 +89,8 @@ class Renderer(val sampleRate: Int) {
                     notes.add(Note(f[0], t, c.vol * 0.5f)); notes.add(Note(f[1], t + (0.13f * sr).toLong(), c.vol * 0.5f))
                 }
                 is Cmd.Noise -> {
-                    if (curL == null || curL!!.size != c.l.size) { curL = c.l; curR = c.r; nxtL = null; pos = 0 }
+                    if (curL == null || curL!!.size != c.l.size) { curL = c.l; curR = c.r; nxtL = null; nxtR = null; queuedL = null; queuedR = null; pos = 0 }
+                    else if (nxtL != null) { queuedL = c.l; queuedR = c.r }   // let the running crossfade finish first
                     else { nxtL = c.l; nxtR = c.r; xfPos = 0 }              // crossfade to the new loop
                 }
                 is Cmd.Jingle -> { jL = c.l; jR = c.r; jPos = -1 }
@@ -99,7 +101,7 @@ class Renderer(val sampleRate: Int) {
     /** Fill [out] with [frames] interleaved stereo floats. */
     fun render(out: FloatArray, frames: Int) {
         drain()
-        val cl = curL; val cr = curR
+        var cl = curL; var cr = curR
         val mTarget = volume * volume
         val wTarget = width
         val dTarget = duckLevel
@@ -116,7 +118,10 @@ class Renderer(val sampleRate: Int) {
                     val a = xfPos.toFloat() / xfLen
                     val g1 = cos(a * PI / 2).toFloat(); val g2 = sin(a * PI / 2).toFloat()
                     l = l * g1 + nl[pos] * g2; r = r * g1 + nr[pos] * g2
-                    if (++xfPos >= xfLen) { curL = nl; curR = nr; nxtL = null; nxtR = null }
+                    if (++xfPos >= xfLen) {                 // done: the new loop takes over from the next sample
+                        curL = nl; curR = nr; cl = nl; cr = nr
+                        nxtL = queuedL; nxtR = queuedR; queuedL = null; queuedR = null; xfPos = 0
+                    }
                 }
                 pos = (pos + 1) and (cl.size - 1)
             } else underflowFrames++
